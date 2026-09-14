@@ -1,674 +1,13 @@
 /**
- * 海戦指揮 AIラボ
+ * naval_ui.js
+ * NavalApp クラス（画面描画・操作・学習ループ）
  *
- * v7 変更点:
- *   - CA（重巡洋艦）追加: 集中砲火スキル
- *   - CVL（軽空母）追加: 航空2隊（小型）
- *   - 観戦モード: 敵艦隊をJSONからインポート可能に
+ * v10 変更点:
+ *   - エクスポートを File System Access API 対応（フォルダ選択可能）
+ *   - プレイヤー配備: ランダム編成ボタン
+ *   - 観戦: 赤軍ランダム編成ボタン
+ *   - 行動パラメータのセッション限定上書き（PVAI敵 / 観戦A / 観戦B）
  */
-
-function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
-const DIRS8 = [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]];
-const AIR_RANGE = 6;
-const AIR_AA_RADIUS = 3;
-const SELF_BUFF_TYPES = new Set(["evade", "dive", "aaBarrage"]);
-
-// ============== ユニット諸元（v7） ==============
-function makeSquadrons() {
-  return [
-    { type:"fighter",  label:"戦闘機隊", hp:30, maxHp:30, attackPower:20 },
-    { type:"attacker", label:"攻撃機隊", hp:25, maxHp:25, attackPower:50 },
-    { type:"bomber",   label:"爆撃機隊", hp:15, maxHp:15, attackPower:75 }
-  ];
-}
-function makeSquadronsLight() {
-  return [
-    { type:"fighter",  label:"戦闘機隊", hp:25, maxHp:25, attackPower:20 },
-    { type:"attacker", label:"攻撃機隊", hp:20, maxHp:20, attackPower:45 }
-  ];
-}
-function makeSquadronsFor(type) {
-  if (type === "CV") return makeSquadrons();
-  if (type === "CVL") return makeSquadronsLight();
-  return null;
-}
-
-const UNIT_TYPES = {
-  BB: {
-    name:"戦艦", hp:130, move:3, gunRange:5, gunPower:40, defense:10, evasion:3, vision:3,
-    aa:4, asw:0, displacement:14000,
-    ability:{ type:"salvo", range:5, centerPower:50, splashPower:22, uses:2, label:"大口径砲" }
-  },
-  CV: {
-    name:"空母", hp:110, move:3, gunRange:2, gunPower:8, defense:5, evasion:5, vision:5,
-    aa:6, asw:5, displacement:18000
-  },
-  CVL: {
-    name:"軽空母", hp:80, move:3, gunRange:2, gunPower:6, defense:4, evasion:6, vision:6,
-    aa:5, asw:3, displacement:11000
-  },
-  CA: {
-    name:"重巡洋艦", hp:110, move:4, gunRange:4, gunPower:28, defense:8, evasion:10, vision:4,
-    aa:8, asw:8, displacement:11000,
-    torpedo:{ range:3, power:40, uses:2 },
-    ability:{ type:"focusedFire", range:5, power:50, uses:2, label:"集中砲火" }
-  },
-  CL: {
-    name:"軽巡洋艦", hp:85, move:5, gunRange:4, gunPower:18, defense:5, evasion:14, vision:4,
-    aa:10, asw:14, displacement:8000,
-    torpedo:{ range:3, power:30, uses:2 },
-    ability:{ type:"aaBarrage", radius:2, boost:12, uses:2, label:"対空射撃" }
-  },
-  DD: {
-    name:"駆逐艦", hp:70, move:5, gunRange:3, gunPower:12, defense:3, evasion:12, vision:4,
-    aa:6, asw:18, displacement:6000,
-    torpedo:{ range:3, power:36, uses:2 },
-    ability:{ type:"evade", boost:15, uses:2, label:"煙幕展開" }
-  },
-  FF: {
-    name:"フリゲート", hp:55, move:6, gunRange:3, gunPower:12, defense:2, evasion:22, vision:5,
-    aa:6, asw:18, displacement:3000,
-    torpedo:{ range:2, power:20, uses:2 },
-    ability:{ type:"aswStrike", range:3, power:45, uses:2, label:"対潜爆雷" }
-  },
-  SS: {
-    name:"潜水艦", hp:55, move:4, gunRange:1, gunPower:3, defense:4, evasion:10, vision:4,
-    aa:0, asw:0, displacement:4000,
-    torpedo:{ range:3, power:65, uses:3 },
-    ability:{ type:"dive", boost:25, uses:2, label:"潜航" }
-  }
-};
-const UNIT_KEYS = Object.keys(UNIT_TYPES);
-
-const ICONS = {
-  BB: `<svg viewBox="0 0 40 40"><ellipse cx="20" cy="20" rx="15" ry="6" fill="var(--unit-color)"/><rect x="16" y="13" width="8" height="5" fill="var(--panel-2)"/><rect x="9" y="17" width="4" height="6" fill="var(--panel-2)"/><rect x="27" y="17" width="4" height="6" fill="var(--panel-2)"/></svg>`,
-  CV: `<svg viewBox="0 0 40 40"><rect x="5" y="16" width="30" height="8" rx="3" fill="var(--unit-color)"/><rect x="23" y="9" width="6" height="8" fill="var(--panel-2)"/></svg>`,
-  CVL: `<svg viewBox="0 0 40 40"><rect x="8" y="17" width="24" height="6" rx="2" fill="var(--unit-color)"/><rect x="24" y="12" width="5" height="6" fill="var(--panel-2)"/></svg>`,
-  CA: `<svg viewBox="0 0 40 40"><ellipse cx="20" cy="20" rx="15" ry="5" fill="var(--unit-color)"/><rect x="10" y="16" width="5" height="4" fill="var(--panel-2)"/><rect x="17" y="14" width="6" height="5" fill="var(--panel-2)"/><rect x="25" y="16" width="5" height="4" fill="var(--panel-2)"/></svg>`,
-  CL: `<svg viewBox="0 0 40 40"><ellipse cx="20" cy="21" rx="13" ry="5" fill="var(--unit-color)"/><rect x="14" y="15" width="6" height="4" fill="var(--panel-2)"/><rect x="22" y="17" width="3" height="5" fill="var(--panel-2)"/></svg>`,
-  DD: `<svg viewBox="0 0 40 40"><polygon points="20,9 27,20 20,31 13,20" fill="var(--unit-color)"/></svg>`,
-  FF: `<svg viewBox="0 0 40 40"><polygon points="20,12 24,20 20,28 16,20" fill="var(--unit-color)"/></svg>`,
-  SS: `<svg viewBox="0 0 40 40"><ellipse cx="20" cy="23" rx="15" ry="5" fill="var(--unit-color)"/><rect x="17" y="11" width="6" height="8" fill="var(--panel-2)"/><rect x="19" y="9" width="2" height="4" fill="var(--unit-color)"/></svg>`
-};
-
-// ============== 固定海域 ==============
-const MAP = {
-  rows: 9, cols: 14,
-  land: [[1,3],[2,3],[1,10],[2,10],[6,3],[7,3],[6,10],[7,10],[4,6],[4,7]],
-  budget: { maxShips: 6, maxDisplacement: 45000 },
-  turnLimit: 50
-};
-MAP.landSet = new Set(MAP.land.map(([r,c]) => `${r},${c}`));
-
-function inBounds(r, c) { return r >= 0 && r < MAP.rows && c >= 0 && c < MAP.cols; }
-function isLand(r, c) { return MAP.landSet.has(`${r},${c}`); }
-function zoneOf(side, r, c) { return side === "A" ? c <= 1 : c >= MAP.cols - 2; }
-function chebyshev(r1, c1, r2, c2) { return Math.max(Math.abs(r1 - r2), Math.abs(c1 - c2)); }
-function unitAt(units, r, c) { return units.find(u => u.r === r && u.c === c && u.hp > 0); }
-
-function unitLabel(unit, mode) {
-  const def = UNIT_TYPES[unit.type];
-  const side = mode === "pvai" ? (unit.side === "A" ? "味方" : "敵") : (unit.side === "A" ? "青軍" : "赤軍");
-  return `${side}${def.name}${unit.flagship ? "(旗艦)" : ""}`;
-}
-
-function fleetDisplacement(fleet) { return fleet.reduce((s, t) => s + UNIT_TYPES[t].displacement, 0); }
-function fleetIsValid(fleet) {
-  if (!fleet || fleet.length === 0) return false;
-  if (fleet.length > MAP.budget.maxShips) return false;
-  if (!fleet.every(t => UNIT_TYPES[t])) return false;
-  if (fleetDisplacement(fleet) > MAP.budget.maxDisplacement) return false;
-  return true;
-}
-function fleetDisplayString(fleet) {
-  const counts = {};
-  fleet.forEach(t => { counts[t] = (counts[t] || 0) + 1; });
-  return Object.entries(counts).map(([t, n]) => `${UNIT_TYPES[t].name}×${n}`).join(" ・ ");
-}
-
-// ============== AI 行動パラメータ ==============
-const WEIGHT_META = [
-  { key:"aggression", label:"積極性（接近）", min:0.2, max:3.0 },
-  { key:"retreatWeight", label:"退避重視度", min:0, max:3.0 },
-  { key:"retreatThreshold", label:"退避HP閾値", min:0.05, max:0.6 },
-  { key:"preferLowHp", label:"低HP優先度", min:0, max:2.0 },
-  { key:"preferFlagship", label:"旗艦優先度", min:0, max:3.0 },
-  { key:"preferHighValue", label:"強艦優先度", min:0, max:2.0 },
-  { key:"torpedoBias", label:"魚雷選好度", min:-1.0, max:2.0 },
-  { key:"abilityPriority", label:"能力使用優先度", min:0, max:1.0 },
-  { key:"airPriority", label:"航空攻撃優先度", min:0, max:2.0 }
-];
-const DEFAULT_WEIGHTS = {
-  aggression:1.4, retreatWeight:0.2, retreatThreshold:0.15, preferLowHp:0.6,
-  preferFlagship:1.0, preferHighValue:0.5, torpedoBias:0.3, abilityPriority:0.25, airPriority:1.0
-};
-const DEFAULT_FLEET = ["BB", "CV", "DD"];
-
-function cloneWeights(w) { return Object.assign({}, w); }
-function mutateWeights(w, rate) {
-  const out = cloneWeights(w);
-  WEIGHT_META.forEach(m => {
-    const span = m.max - m.min;
-    const delta = (Math.random() - Math.random()) * span * rate;
-    out[m.key] = clamp(out[m.key] + delta, m.min, m.max);
-  });
-  return out;
-}
-function weightsEqual(a, b) { return WEIGHT_META.every(m => Math.abs(a[m.key] - b[m.key]) < 1e-9); }
-
-// ============== 艦隊編成 ==============
-function mutateFleet(fleet) {
-  for (let attempt = 0; attempt < 16; attempt++) {
-    const out = fleet.slice();
-    const op = Math.random();
-    if (op < 0.30 && out.length < MAP.budget.maxShips) {
-      const t = UNIT_KEYS[Math.floor(Math.random() * UNIT_KEYS.length)];
-      if (fleetDisplacement(out) + UNIT_TYPES[t].displacement <= MAP.budget.maxDisplacement) {
-        out.push(t); return out;
-      }
-    } else if (op < 0.60 && out.length > 1) {
-      out.splice(Math.floor(Math.random() * out.length), 1);
-      return out;
-    } else {
-      const i = Math.floor(Math.random() * out.length);
-      const t = UNIT_KEYS[Math.floor(Math.random() * UNIT_KEYS.length)];
-      const nf = out.slice(); nf[i] = t;
-      if (fleetDisplacement(nf) <= MAP.budget.maxDisplacement) return nf;
-    }
-  }
-  return fleet.slice();
-}
-function fleetsEqual(a, b) {
-  if (a.length !== b.length) return false;
-  const sa = a.slice().sort(), sb = b.slice().sort();
-  return sa.every((v, i) => v === sb[i]);
-}
-
-// ============== ゲノム ==============
-function cloneGenome(g) { return { weights: cloneWeights(g.weights), fleet: g.fleet.slice() }; }
-
-function mutateGenome(g, rate, mode) {
-  const out = cloneGenome(g);
-  if (mode === "fleet") {
-    const mf = mutateFleet(g.fleet);
-    out.fleet = fleetIsValid(mf) ? mf : g.fleet.slice();
-    return out;
-  }
-  if (mode === "weights") {
-    out.weights = mutateWeights(g.weights, rate);
-    return out;
-  }
-  const r = Math.random();
-  if (r < 0.50) {
-    out.weights = mutateWeights(g.weights, rate);
-  } else if (r < 0.90) {
-    const mf = mutateFleet(g.fleet);
-    out.fleet = fleetIsValid(mf) ? mf : g.fleet.slice();
-  } else {
-    out.weights = mutateWeights(g.weights, rate);
-    const mf = mutateFleet(g.fleet);
-    out.fleet = fleetIsValid(mf) ? mf : g.fleet.slice();
-  }
-  return out;
-}
-
-// ============== 幾何・視界 ==============
-function reachableTiles(units, unit) {
-  const def = UNIT_TYPES[unit.type];
-  const visited = new Map();
-  visited.set(`${unit.r},${unit.c}`, 0);
-  const queue = [{ r: unit.r, c: unit.c }];
-  const result = new Set();
-  while (queue.length) {
-    const cur = queue.shift();
-    const curDist = visited.get(`${cur.r},${cur.c}`);
-    if (curDist >= def.move) continue;
-    for (const [dr, dc] of DIRS8) {
-      const nr = cur.r + dr, nc = cur.c + dc;
-      if (!inBounds(nr, nc) || isLand(nr, nc)) continue;
-      if (unitAt(units, nr, nc)) continue;
-      const k = `${nr},${nc}`;
-      if (visited.has(k)) continue;
-      visited.set(k, curDist + 1);
-      result.add(k);
-      queue.push({ r: nr, c: nc });
-    }
-  }
-  return result;
-}
-
-function computeVisibility(units, side) {
-  const set = new Set();
-  units.filter(u => u.side === side && u.hp > 0).forEach(u => {
-    const vis = UNIT_TYPES[u.type].vision;
-    for (let r = 0; r < MAP.rows; r++) {
-      for (let c = 0; c < MAP.cols; c++) {
-        if (chebyshev(u.r, u.c, r, c) <= vis) set.add(`${r},${c}`);
-      }
-    }
-  });
-  return set;
-}
-
-// ============== 対空防御 ==============
-function computeAirDefense(units, side, r, c) {
-  let total = 0;
-  units.filter(u => u.side === side && u.hp > 0).forEach(u => {
-    const dist = chebyshev(u.r, u.c, r, c);
-    if (dist > AIR_AA_RADIUS) return;
-    const falloff = 1 - dist * 0.2;
-    total += (UNIT_TYPES[u.type].aa || 0) * falloff;
-    if (u.squadrons) {
-      u.squadrons.forEach(s => {
-        if (s.type === "fighter" && s.hp > 0) total += (s.hp / 5) * falloff;
-      });
-    }
-    if (u.aaBuff && u.aaBuff > 0) total += u.aaBuff * falloff;
-  });
-  return Math.round(total);
-}
-
-// ============== 戦闘解決 ==============
-function computeDamage(power, maxRange, dist, targetDef, effectiveEvasion, ignoreDefense) {
-  const rangeFactor = 1 - ((dist - 1) / Math.max(1, maxRange - 1)) * 0.4;
-  const raw = power * rangeFactor;
-  const afterEvasion = raw * (1 - effectiveEvasion / 100);
-  const defense = ignoreDefense ? 0 : targetDef;
-  return Math.max(1, Math.round(afterEvasion - defense));
-}
-
-function resolveAttack(attacker, target, weapon, attackerLabel, targetLabel, logFn, units) {
-  const def = UNIT_TYPES[attacker.type];
-  const tDef = UNIT_TYPES[target.type];
-  const dist = chebyshev(attacker.r, attacker.c, target.r, target.c);
-  let power, maxRange, label, ignoreDefense = false, isAir = false, sq = null;
-
-  if (weapon.startsWith("air-")) {
-    isAir = true;
-    const sqType = weapon.substring(4);
-    sq = attacker.squadrons ? attacker.squadrons.find(s => s.type === sqType && s.hp > 0) : null;
-    if (!sq) return { hit:false };
-    power = sq.attackPower * (sq.hp / sq.maxHp);
-    maxRange = AIR_RANGE;
-    label = `${sq.label}による航空攻撃`;
-    ignoreDefense = true;
-  } else if (weapon === "torpedo") {
-    power = def.torpedo.power; maxRange = def.torpedo.range; label = "魚雷";
-    attacker.torpedoUses--;
-  } else if (weapon === "asw") {
-    power = def.ability.power; maxRange = def.ability.range; label = def.ability.label;
-    ignoreDefense = true;
-    attacker.abilityUses--;
-  } else if (weapon === "focused") {
-    power = def.ability.power; maxRange = def.ability.range; label = def.ability.label;
-    ignoreDefense = false;
-    attacker.abilityUses--;
-  } else {
-    power = def.gunPower; maxRange = def.gunRange; label = "砲撃";
-  }
-
-  const effectiveEvasion = tDef.evasion + (target.evasionBuff || 0);
-  let dmg = computeDamage(power, maxRange, dist, tDef.defense, effectiveEvasion, ignoreDefense);
-
-  // 潜水艦への減衰 / 対潜ボーナス
-  if (target.type === "SS" && weapon !== "asw") {
-    const asw = def.asw || 0;
-    if (asw === 0) dmg = Math.max(1, Math.floor(dmg * 0.4));
-    else dmg = Math.max(1, Math.round(dmg * (1 + asw * 0.03)));
-  }
-
-  let airDef = 0;
-  if (isAir) {
-    airDef = computeAirDefense(units, target.side, target.r, target.c);
-    dmg = Math.max(1, dmg - airDef);
-  }
-
-  target.hp = Math.max(0, target.hp - dmg);
-
-  if (isAir && sq) {
-    const aaFire = Math.max(0, Math.round(airDef * 0.6));
-    if (aaFire > 0) {
-      sq.hp = Math.max(0, sq.hp - aaFire);
-      if (logFn) logFn(`対空砲火と戦闘機隊の反撃！${sq.label}に${aaFire}の損害。${sq.hp <= 0 ? "（撃墜）" : ""}`);
-    }
-  }
-
-  if (logFn) logFn(`${attackerLabel}の${label}が${targetLabel}に命中、${dmg}ダメージ！${target.hp <= 0 ? "（撃沈）" : ""}`);
-  return { hit:true, dmg, sunk: target.hp <= 0 };
-}
-
-// 大口径砲（3×3範囲攻撃）
-function resolveSalvo(attacker, centerR, centerC, units, logFn) {
-  const def = UNIT_TYPES[attacker.type];
-  const ab = def.ability;
-  const attackerLabel = unitLabel(attacker, "pvai");
-  const results = [];
-  for (let dr = -1; dr <= 1; dr++) {
-    for (let dc = -1; dc <= 1; dc++) {
-      const r = centerR + dr, c = centerC + dc;
-      if (!inBounds(r, c)) continue;
-      const target = unitAt(units, r, c);
-      if (!target || target.side === attacker.side) continue;
-      const dist = chebyshev(attacker.r, attacker.c, r, c);
-      if (dist > ab.range) continue;
-      const isCenter = (dr === 0 && dc === 0);
-      const basePower = isCenter ? ab.centerPower : ab.splashPower;
-      const rangeFactor = 1 - ((dist - 1) / Math.max(1, ab.range - 1)) * 0.4;
-      const power = basePower * rangeFactor;
-      const tDef = UNIT_TYPES[target.type];
-      const effEvasion = tDef.evasion + (target.evasionBuff || 0);
-      let dmg = Math.max(1, Math.round(power * (1 - effEvasion / 100) - tDef.defense));
-      if (target.type === "SS") {
-        const asw = def.asw || 0;
-        dmg = asw === 0 ? Math.max(1, Math.floor(dmg * 0.4)) : Math.max(1, Math.round(dmg * (1 + asw * 0.03)));
-      }
-      target.hp = Math.max(0, target.hp - dmg);
-      results.push({ target, dmg, isCenter });
-      if (logFn) logFn(`${attackerLabel}の大口径砲が${unitLabel(target, "pvai")}に命中、${dmg}ダメージ！${target.hp <= 0 ? "（撃沈）" : ""}`);
-    }
-  }
-  attacker.abilityUses--;
-  return results;
-}
-
-function estimateDamage(attackerType, targetType, dist, range, power, weapon, targetEvasionBuff) {
-  const tDef = UNIT_TYPES[targetType];
-  const effectiveEvasion = tDef.evasion + (targetEvasionBuff || 0);
-  const isAir = weapon.startsWith("air-");
-  let dmg = computeDamage(power, range, dist, tDef.defense, effectiveEvasion, isAir || weapon === "asw");
-  if (targetType === "SS" && weapon !== "asw") {
-    const asw = UNIT_TYPES[attackerType].asw || 0;
-    if (asw === 0) dmg = Math.max(1, Math.floor(dmg * 0.4));
-    else dmg = Math.max(1, Math.round(dmg * (1 + asw * 0.03)));
-  }
-  return dmg;
-}
-
-// ============== 攻撃候補の選択 ==============
-function pickBestAttack(unit, oppVisible, weights) {
-  const def = UNIT_TYPES[unit.type];
-  let best = null;
-
-  const consider = (weapon, range, power) => {
-    if (range == null || range <= 0) return;
-    oppVisible.forEach(t => {
-      const dist = chebyshev(unit.r, unit.c, t.r, t.c);
-      if (dist > range) return;
-      const tDef = UNIT_TYPES[t.type];
-      const hpFrac = t.hp / tDef.hp;
-      const estDmg = estimateDamage(unit.type, t.type, dist, range, power, weapon, t.evasionBuff);
-      let score = estDmg * 0.04
-                + weights.preferLowHp * (1 - hpFrac)
-                + weights.preferFlagship * (t.flagship ? 1 : 0)
-                + weights.preferHighValue * (tDef.gunPower / 40)
-                - dist * 0.05;
-      if (weapon === "torpedo") score += weights.torpedoBias;
-      if (weapon.startsWith("air-")) score *= weights.airPriority;
-      if (t.type === "SS" && (def.asw || 0) === 0) score *= 0.35;
-      if (!best || score > best.score) best = { target: t, weapon, score };
-    });
-  };
-
-  consider("gun", def.gunRange, def.gunPower);
-  if (def.torpedo && unit.torpedoUses > 0) consider("torpedo", def.torpedo.range, def.torpedo.power);
-
-  // 大口径砲
-  if (def.ability && def.ability.type === "salvo" && unit.abilityUses > 0) {
-    oppVisible.forEach(t => {
-      const dist = chebyshev(unit.r, unit.c, t.r, t.c);
-      if (dist > def.ability.range) return;
-      let enemiesInArea = 0;
-      for (let dr = -1; dr <= 1; dr++) {
-        for (let dc = -1; dc <= 1; dc++) {
-          if (oppVisible.find(o => o.r === t.r + dr && o.c === t.c + dc)) enemiesInArea++;
-        }
-      }
-      if (enemiesInArea < 2) return;
-      const estDmg = estimateDamage(unit.type, t.type, dist, def.ability.range, def.ability.centerPower, "gun", t.evasionBuff);
-      const tDef = UNIT_TYPES[t.type];
-      const hpFrac = t.hp / tDef.hp;
-      const score = estDmg * 0.04
-                  + weights.preferLowHp * (1 - hpFrac)
-                  + weights.preferFlagship * (t.flagship ? 1 : 0)
-                  + enemiesInArea * 0.5
-                  - dist * 0.05;
-      if (!best || score > best.score) best = { target: t, weapon: "salvo", score };
-    });
-  }
-
-  // 集中砲火（CA）
-  if (def.ability && def.ability.type === "focusedFire" && unit.abilityUses > 0) {
-    oppVisible.forEach(t => {
-      const dist = chebyshev(unit.r, unit.c, t.r, t.c);
-      if (dist > def.ability.range) return;
-      const tDef = UNIT_TYPES[t.type];
-      const hpFrac = t.hp / tDef.hp;
-      const estDmg = estimateDamage(unit.type, t.type, dist, def.ability.range, def.ability.power, "gun", t.evasionBuff);
-      const score = estDmg * 0.05
-                  + weights.preferLowHp * (1 - hpFrac)
-                  + weights.preferFlagship * (t.flagship ? 1 : 0)
-                  + weights.preferHighValue * (tDef.gunPower / 40)
-                  - dist * 0.05;
-      if (!best || score > best.score) best = { target: t, weapon: "focused", score };
-    });
-  }
-
-  // 対潜爆雷（FF）
-  if (def.ability && def.ability.type === "aswStrike" && unit.abilityUses > 0) {
-    oppVisible.forEach(t => {
-      if (t.type !== "SS") return;
-      const dist = chebyshev(unit.r, unit.c, t.r, t.c);
-      if (dist > def.ability.range) return;
-      const tDef = UNIT_TYPES[t.type];
-      const hpFrac = t.hp / tDef.hp;
-      const estDmg = computeDamage(def.ability.power, def.ability.range, dist, tDef.defense, tDef.evasion, true);
-      const score = estDmg * 0.08
-                  + weights.preferLowHp * (1 - hpFrac)
-                  + weights.preferFlagship * (t.flagship ? 1 : 0)
-                  - dist * 0.05;
-      if (!best || score > best.score) best = { target: t, weapon: "asw", score };
-    });
-  }
-
-  // 航空攻撃
-  if (unit.squadrons) {
-    unit.squadrons.forEach(sq => {
-      if (sq.hp <= 0) return;
-      const power = sq.attackPower * (sq.hp / sq.maxHp);
-      consider("air-" + sq.type, AIR_RANGE, power);
-    });
-  }
-
-  return best;
-}
-
-// ============== AI 意思決定 ==============
-function aiActUnit(units, unit, side, weights, visibleSet, mode, observerVisible, logFn) {
-  if (unit.hp <= 0) return;
-  const def = UNIT_TYPES[unit.type];
-  const oppSide = side === "A" ? "B" : "A";
-  const hidden = mode === "pvai" && !!observerVisible;
-  const wasObserverVisible = hidden ? observerVisible.has(`${unit.r},${unit.c}`) : true;
-
-  const oppVisible = units.filter(u => u.side === oppSide && u.hp > 0 && visibleSet.has(`${u.r},${u.c}`));
-  const hpFrac = unit.hp / def.hp;
-  const wantsRetreat = hpFrac < weights.retreatThreshold;
-
-  let goal;
-  if (oppVisible.length) {
-    goal = oppVisible.slice().sort((a, b) => {
-      const da = chebyshev(unit.r, unit.c, a.r, a.c) - chebyshev(unit.r, unit.c, b.r, b.c);
-      if (da !== 0) return da;
-      return (a.id < b.id ? -1 : 1);
-    })[0];
-  } else {
-    goal = side === "A" ? { r: Math.floor(MAP.rows / 2), c: MAP.cols - 1 } : { r: Math.floor(MAP.rows / 2), c: 0 };
-  }
-
-  const reachable = reachableTiles(units, unit);
-  const candidates = [{ r: unit.r, c: unit.c }].concat(Array.from(reachable).map(k => {
-    const [r, c] = k.split(",").map(Number); return { r, c };
-  }));
-
-  let bestTile = { r: unit.r, c: unit.c }, bestScore = -Infinity;
-  candidates.forEach(t => {
-    const d = chebyshev(t.r, t.c, goal.r, goal.c);
-    let score = -d * weights.aggression;
-    if (wantsRetreat) score += d * weights.retreatWeight;
-    if (score > bestScore || (score === bestScore && (t.r < bestTile.r || (t.r === bestTile.r && t.c < bestTile.c)))) {
-      bestScore = score; bestTile = t;
-    }
-  });
-
-  const moved = (bestTile.r !== unit.r || bestTile.c !== unit.c);
-  if (moved) {
-    const destObserverVisible = hidden ? observerVisible.has(`${bestTile.r},${bestTile.c}`) : true;
-    if (logFn && (!hidden || wasObserverVisible || destObserverVisible)) {
-      const label = (hidden && !wasObserverVisible && !destObserverVisible) ? "正体不明の艦" : unitLabel(unit, mode);
-      logFn(`${label}が(${bestTile.r + 1},${bestTile.c + 1})付近へ移動した。`);
-    }
-    unit.r = bestTile.r; unit.c = bestTile.c;
-  }
-  unit.hasMoved = true;
-
-  const oppVisibleNow = units.filter(u => u.side === oppSide && u.hp > 0 && visibleSet.has(`${u.r},${u.c}`));
-  const atk = pickBestAttack(unit, oppVisibleNow, weights);
-
-  const lowHp = unit.hp / def.hp < 0.5;
-  const evadeLike = def.ability && (def.ability.type === "evade" || def.ability.type === "dive");
-  const wantsEvade = evadeLike && lowHp && unit.abilityUses > 0 && oppVisibleNow.length > 0;
-
-  const atkObserverVisible = hidden ? observerVisible.has(`${unit.r},${unit.c}`) : true;
-  const actorLabel = (hidden && !atkObserverVisible) ? "正体不明の敵" : unitLabel(unit, mode);
-
-  if (atk && !wantsEvade) {
-    if (atk.weapon === "salvo") {
-      const res = resolveSalvo(unit, atk.target.r, atk.target.c, units, logFn);
-      unit.hasActed = true;
-      return res;
-    } else {
-      const targetLabel = unitLabel(atk.target, mode);
-      resolveAttack(unit, atk.target, atk.weapon, actorLabel, targetLabel, logFn, units);
-      unit.hasActed = true;
-      return;
-    }
-  }
-
-  if (wantsEvade) {
-    unit.evasionBuff = (unit.evasionBuff || 0) + def.ability.boost;
-    unit.abilityUses--;
-    unit.hasActed = true;
-    if (logFn && (!hidden || atkObserverVisible)) logFn(`${unitLabel(unit, mode)}が${def.ability.label}を展開、回避力が上昇した。`);
-    return;
-  }
-
-  if (def.ability && def.ability.type === "aaBarrage" && unit.abilityUses > 0) {
-    if (oppVisibleNow.some(t => t.squadrons && t.squadrons.some(s => s.hp > 0))) {
-      unit.aaBuff = (unit.aaBuff || 0) + def.ability.boost;
-      unit.abilityUses--;
-      unit.hasActed = true;
-      if (logFn && (!hidden || wasObserverVisible)) logFn(`${unitLabel(unit, mode)}が${def.ability.label}を展開、周辺の対空火力が上昇した。`);
-      return;
-    }
-  }
-
-  unit.hasActed = true;
-}
-
-function runAISidePhase(battle, side, weights, observerSide) {
-  const units = battle.units;
-  units.forEach(u => {
-    if (u.side === side) { u.hasMoved = false; u.hasActed = false; u.evasionBuff = 0; u.aaBuff = 0; }
-  });
-  const visible = computeVisibility(units, side);
-  const observerVisible = observerSide ? computeVisibility(units, observerSide) : null;
-  const logFn = battle.log || null;
-  units.filter(u => u.side === side && u.hp > 0).forEach(unit => {
-    aiActUnit(units, unit, side, weights, visible, battle.mode, observerVisible, logFn);
-  });
-}
-
-function checkOutcome(battle) {
-  const aAlive = battle.units.filter(u => u.side === "A" && u.hp > 0).length;
-  const bAlive = battle.units.filter(u => u.side === "B" && u.hp > 0).length;
-  if (aAlive === 0 && bAlive === 0) return { done:true, winner:null };
-  if (aAlive === 0) return { done:true, winner:"B" };
-  if (bAlive === 0) return { done:true, winner:"A" };
-  if (battle.turn > MAP.turnLimit) {
-    const aHp = battle.units.filter(u => u.side === "A").reduce((s, u) => s + u.hp, 0);
-    const bHp = battle.units.filter(u => u.side === "B").reduce((s, u) => s + u.hp, 0);
-    if (aHp === bHp) return { done:true, winner:null };
-    return { done:true, winner: aHp > bHp ? "A" : "B" };
-  }
-  return null;
-}
-
-// ============== 編成配備 ==============
-function formationPositions(side, count, randomize) {
-  let rows;
-  if (count === 1) rows = [4];
-  else if (count === 2) rows = [3, 5];
-  else if (count === 3) rows = [2, 4, 6];
-  else if (count === 4) rows = [1, 3, 5, 7];
-  else if (count === 5) rows = [1, 3, 5, 6, 7];
-  else rows = [1, 2, 3, 5, 6, 7];
-  const positions = [];
-  for (let i = 0; i < count; i++) {
-    const r = rows[i];
-    let c;
-    if (side === "A") {
-      c = randomize ? (Math.random() < 0.5 ? 0 : 1) : (i % 2 === 0 ? 0 : 1);
-    } else {
-      c = randomize ? (Math.random() < 0.5 ? MAP.cols - 1 : MAP.cols - 2) : (i % 2 === 0 ? MAP.cols - 1 : MAP.cols - 2);
-    }
-    positions.push([r, c]);
-  }
-  return positions;
-}
-
-function deployFleet(units, side, seq, fleet, opts) {
-  const randomize = !!(opts && opts.randomize);
-  const positions = formationPositions(side, fleet.length, randomize);
-  fleet.forEach((t, i) => {
-    const def = UNIT_TYPES[t];
-    const [r, c] = positions[i];
-    units.push({
-      id: `${side}-${seq.n++}`, side, type: t, r, c,
-      hp: def.hp, maxHp: def.hp, flagship: i === 0,
-      hasMoved:false, hasActed:false, evasionBuff:0, aaBuff:0,
-      torpedoUses: def.torpedo ? def.torpedo.uses : 0,
-      abilityUses: def.ability ? def.ability.uses : 0,
-      squadrons: makeSquadronsFor(t)
-    });
-  });
-}
-
-// ============== 高速シミュレーション ==============
-function simulateMatch(genomeA, genomeB, opts) {
-  const randomize = !opts || opts.randomize !== false;
-  const seq = { n: 0 };
-  const units = [];
-  deployFleet(units, "A", seq, genomeA.fleet, { randomize });
-  deployFleet(units, "B", seq, genomeB.fleet, { randomize });
-  const battle = { units, turn: 1, mode: "sim", log: null };
-  let guard = 0;
-  while (guard < 400) {
-    guard++;
-    runAISidePhase(battle, "A", genomeA.weights, null);
-    let oc = checkOutcome(battle);
-    if (oc) return { winner: oc.winner, turns: battle.turn };
-    runAISidePhase(battle, "B", genomeB.weights, null);
-    oc = checkOutcome(battle);
-    if (oc) return { winner: oc.winner, turns: battle.turn };
-    battle.turn++;
-    oc = checkOutcome(battle);
-    if (oc) return { winner: oc.winner, turns: battle.turn };
-  }
-  return { winner: null, turns: battle.turn };
-}
-
-// ============== アプリ本体 ==============
-const SAVE_VERSION = 3;
 
 class NavalApp {
   constructor() {
@@ -685,8 +24,101 @@ class NavalApp {
     this.spectatePlaying = false;
     this.spectateSpeed = 700;
     this.spectateState = null;
-    this.spectateEnemyFleet = null;  // インポートされた敵艦隊
+    this.spectateEnemyFleet = null;
+    // セッション限定の重みオーバーライド（null なら既定）
+    this.customEnemyWeights = null;
+    this.customSpectateWeightsA = null;
+    this.customSpectateWeightsB = null;
     this.render();
+    this.spectateEnemyFleet = null;
+    this.pvaiEnemyFleet = null;
+    // セッション限定の重みオーバーライド（null なら既定）
+  }
+
+  // ---------- 重みオーバーライド ----------
+  getEnemyWeights() { return this.customEnemyWeights || this.champion.weights; }
+  getSpectateWeightsA() { return this.customSpectateWeightsA || this.champion.weights; }
+  getSpectateWeightsB() {
+    if (this.customSpectateWeightsB) return this.customSpectateWeightsB;
+    return this.spectateEnemyFleet ? DEFAULT_WEIGHTS : this.baseline.weights;
+  }
+  getCustomWeights(side) {
+    if (side === "enemy") return this.customEnemyWeights;
+    if (side === "A") return this.customSpectateWeightsA;
+    if (side === "B") return this.customSpectateWeightsB;
+    return null;
+  }
+  enableCustomWeights(side) {
+    if (side === "enemy" && !this.customEnemyWeights) this.customEnemyWeights = cloneWeights(this.champion.weights);
+    if (side === "A" && !this.customSpectateWeightsA) this.customSpectateWeightsA = cloneWeights(this.champion.weights);
+    if (side === "B" && !this.customSpectateWeightsB) {
+      const base = this.spectateEnemyFleet ? DEFAULT_WEIGHTS : this.baseline.weights;
+      this.customSpectateWeightsB = cloneWeights(base);
+    }
+    this.render();
+  }
+  resetCustomWeights(side) {
+    if (side === "enemy") this.customEnemyWeights = null;
+    if (side === "A") this.customSpectateWeightsA = null;
+    if (side === "B") this.customSpectateWeightsB = null;
+    this.render();
+  }
+  setWeight(side, key, value) {
+    const w = this.getCustomWeights(side);
+    if (!w) return;
+    w[key] = Number(value);
+    this.render();
+  }
+
+  aiSettingsPanelHTML(side, title) {
+    const custom = this.getCustomWeights(side);
+    if (!custom) {
+      return `
+        <div style="padding:8px 0;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+            <strong style="font-size:0.9em;">${title}</strong>
+            <button class="ghost" style="font-size:0.8em; padding:4px 10px;" onclick="game.enableCustomWeights('${side}')">編集する</button>
+          </div>
+          <p class="hint" style="margin:0;">既定のAIを使用します。編集するとこのセッションのみカスタム値で動作します。</p>
+        </div>`;
+    }
+    return `
+      <div style="padding:8px 0;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+          <strong style="font-size:0.9em;">${title}（カスタム）</strong>
+          <button class="ghost" style="font-size:0.8em; padding:4px 10px;" onclick="game.resetCustomWeights('${side}')">既定に戻す</button>
+        </div>
+        ${WEIGHT_META.map(m => `
+          <div style="display:flex; align-items:center; gap:8px; padding:2px 0; font-size:0.8em;">
+            <span style="flex:1; color:var(--ink-dim);">${m.label}</span>
+            <input type="range" min="${m.min}" max="${m.max}" step="0.05" value="${custom[m.key]}" oninput="game.setWeight('${side}','${m.key}', this.value)" style="width:100px;">
+            <span style="font-family:'JetBrains Mono',monospace; width:2.8em; text-align:right;">${custom[m.key].toFixed(2)}</span>
+          </div>`).join("")}
+      </div>`;
+  }
+
+  // ---------- ランダム編成 ----------
+  randomizePlayerFleet() {
+    const fleet = randomFleet();
+    this.deployUnits = [];
+    const positions = formationPositions("A", fleet.length, false);
+    fleet.forEach((t, i) => {
+      const [r, c] = positions[i];
+      this.deployUnits.push({ type: t, r, c });
+    });
+    this.toast(`ランダム編成: ${fleetDisplayString(fleet)}`, "info");
+    this.render();
+  }
+
+  randomizeSpectateEnemy() {
+    const fleet = randomFleet();
+    this.spectateEnemyFleet = fleet.slice();
+    this.toast(`敵艦隊をランダム設定: ${fleetDisplayString(fleet)}`, "success");
+    if (this.screen === "battle" && this.battle && this.battle.mode === "spectate") {
+      this.startSpectate();
+    } else {
+      this.render();
+    }
   }
 
   pushLog(msg) {
@@ -713,7 +145,8 @@ class NavalApp {
     this.render();
   }
 
-  exportSave() {
+  // ---------- セーブデータ ----------
+  async exportSave() {
     if (this.isTraining) return;
     const data = {
       version: SAVE_VERSION,
@@ -727,17 +160,38 @@ class NavalApp {
       trainingMode: this.trainingMode
     };
     const json = JSON.stringify(data, null, 2);
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const filename = `naval_ai_save_${stamp}.json`;
+
+    // File System Access API（フォルダ選択可能）
+    if (window.showSaveFilePicker) {
+      try {
+        const handle = await window.showSaveFilePicker({
+          suggestedName: filename,
+          types: [{ description: "JSON ファイル", accept: { "application/json": [".json"] } }]
+        });
+        const writable = await handle.createWritable();
+        await writable.write(json);
+        await writable.close();
+        this.toast("セーブデータを保存しました", "success");
+        return;
+      } catch (err) {
+        if (err && err.name === "AbortError") return; // ユーザーがキャンセル
+        // 他のエラーはフォールバックへ
+      }
+    }
+
+    // フォールバック: ブラウザのダウンロード
     const blob = new Blob([json], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     a.href = url;
-    a.download = `naval_ai_save_${stamp}.json`;
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-    this.toast("セーブデータをエクスポートしました", "success");
+    this.toast("セーブデータをダウンロードしました", "success");
   }
 
   handleImportFile(input) {
@@ -774,7 +228,6 @@ class NavalApp {
     reader.readAsText(file);
   }
 
-  // ---------- 観戦用: 敵艦隊インポート ----------
   importSpectateEnemy(input) {
     const file = input.files && input.files[0];
     if (!file) return;
@@ -783,30 +236,16 @@ class NavalApp {
       try {
         const data = JSON.parse(e.target.result);
         let fleet = null;
-        if (Array.isArray(data)) {
-          fleet = data;
-        } else if (data && data.champion && Array.isArray(data.champion.fleet)) {
-          fleet = data.champion.fleet;
-        } else if (data && Array.isArray(data.fleet)) {
-          fleet = data.fleet;
-        }
-        if (!fleet || fleet.length === 0) {
-          throw new Error("有効な艦隊データが見つかりません");
-        }
-        if (!fleet.every(t => UNIT_TYPES[t])) {
-          throw new Error("未知の艦種が含まれています");
-        }
-        if (!fleetIsValid(fleet)) {
-          throw new Error("編成が現在のルールで無効です（予算超過など）");
-        }
+        if (Array.isArray(data)) fleet = data;
+        else if (data && data.champion && Array.isArray(data.champion.fleet)) fleet = data.champion.fleet;
+        else if (data && Array.isArray(data.fleet)) fleet = data.fleet;
+        if (!fleet || fleet.length === 0) throw new Error("有効な艦隊データが見つかりません");
+        if (!fleet.every(t => UNIT_TYPES[t])) throw new Error("未知の艦種が含まれています");
+        if (!fleetIsValid(fleet)) throw new Error("編成が現在のルールで無効です（予算超過など）");
         this.spectateEnemyFleet = fleet.slice();
         this.toast(`敵艦隊を設定: ${fleetDisplayString(fleet)}`, "success");
-        // 観戦中なら再起動
-        if (this.screen === "battle" && this.battle && this.battle.mode === "spectate") {
-          this.startSpectate();
-        } else {
-          this.render();
-        }
+        if (this.screen === "battle" && this.battle && this.battle.mode === "spectate") this.startSpectate();
+        else this.render();
       } catch (err) {
         this.toast("読み込み失敗: " + err.message, "danger");
       } finally {
@@ -819,11 +258,48 @@ class NavalApp {
   clearSpectateEnemy() {
     this.spectateEnemyFleet = null;
     this.toast("敵艦隊を初期AIに戻しました", "info");
-    if (this.screen === "battle" && this.battle && this.battle.mode === "spectate") {
-      this.startSpectate();
-    } else {
-      this.render();
-    }
+    if (this.screen === "battle" && this.battle && this.battle.mode === "spectate") this.startSpectate();
+    else this.render();
+  }
+
+    // ---------- PVAI用: 敵編成の設定 ----------
+  randomizePvAIEnemy() {
+    const fleet = randomFleet();
+    this.pvaiEnemyFleet = fleet.slice();
+    this.toast(`敵編成をランダム設定: ${fleetDisplayString(fleet)}`, "success");
+    this.render();
+  }
+
+  importPvAIEnemy(input) {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target.result);
+        let fleet = null;
+        if (Array.isArray(data)) fleet = data;
+        else if (data && data.champion && Array.isArray(data.champion.fleet)) fleet = data.champion.fleet;
+        else if (data && Array.isArray(data.fleet)) fleet = data.fleet;
+        if (!fleet || fleet.length === 0) throw new Error("有効な艦隊データが見つかりません");
+        if (!fleet.every(t => UNIT_TYPES[t])) throw new Error("未知の艦種が含まれています");
+        if (!fleetIsValid(fleet)) throw new Error("編成が現在のルールで無効です（予算超過など）");
+        this.pvaiEnemyFleet = fleet.slice();
+        this.toast(`敵編成を設定: ${fleetDisplayString(fleet)}`, "success");
+        this.render();
+      } catch (err) {
+        this.toast("読み込み失敗: " + err.message, "danger");
+      } finally {
+        input.value = "";
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  clearPvAIEnemy() {
+    this.pvaiEnemyFleet = null;
+    this.toast("敵編成を学習済みAIに戻しました", "info");
+    this.render();
   }
 
   // ---------- プレイヤー対AI ----------
@@ -873,8 +349,9 @@ class NavalApp {
         squadrons: makeSquadronsFor(p.type)
       });
     });
-    deployFleet(units, "B", seq, this.champion.fleet, { randomize: false });
-    this.battle = { units, turn:1, mode:"pvai", logLines:[], selectedUnitId:null, uiMode:"idle", highlight:new Set(), tempRevealed:new Set() };
+    const enemyFleet = this.pvaiEnemyFleet || this.champion.fleet;
+    deployFleet(units, "B", seq, enemyFleet, { randomize: false });
+    this.battle = { units, turn:1, mode:"pvai", logLines:[], selectedUnitId:null, inspectUnitId:null, uiMode:"idle", highlight:new Set(), tempRevealed:new Set(), squadronSelection:new Set() };
     this.battle.log = (msg) => this.pushLog(msg);
     this.screen = "battle";
     this.startSideATurn();
@@ -883,17 +360,21 @@ class NavalApp {
   startSideATurn() {
     this.battle.units.forEach(u => { if (u.side === "A") { u.hasMoved = false; u.hasActed = false; u.evasionBuff = 0; u.aaBuff = 0; } });
     this.battle.tempRevealed = new Set();
+    this.battle.squadronSelection = new Set();
     this.battle.baseVisible = computeVisibility(this.battle.units, "A");
     this.pushLog(`--- ターン${this.battle.turn} 作戦開始 ---`);
     this.render();
   }
 
   endSideATurn() {
-    runAISidePhase(this.battle, "B", this.champion.weights, "A");
+    runAISidePhase(this.battle, "B", this.getEnemyWeights(), "A");
     if (this.battle.selectedUnitId && !this.selectedUnit()) {
       this.battle.selectedUnitId = null;
       this.battle.uiMode = "idle";
       this.battle.highlight = new Set();
+    }
+    if (this.battle.inspectUnitId && !this.battle.units.find(u => u.id === this.battle.inspectUnitId && u.hp > 0)) {
+      this.battle.inspectUnitId = null;
     }
     let oc = checkOutcome(this.battle);
     if (oc) { this.finishBattle(oc); return; }
@@ -911,9 +392,21 @@ class NavalApp {
   }
 
   // ---------- プレイヤー操作 ----------
-  selectUnit(id) { this.battle.selectedUnitId = id; this.battle.uiMode = "idle"; this.battle.highlight = new Set(); this.render(); }
+  selectUnit(id) {
+    this.battle.selectedUnitId = id;
+    this.battle.inspectUnitId = null;
+    this.battle.uiMode = "idle";
+    this.battle.highlight = new Set();
+    this.battle.squadronSelection = new Set();
+    this.render();
+  }
   selectedUnit() {
     const u = this.battle.units.find(u => u.id === this.battle.selectedUnitId);
+    return (u && u.hp > 0) ? u : null;
+  }
+  inspectedUnit() {
+    if (!this.battle.inspectUnitId) return null;
+    const u = this.battle.units.find(u => u.id === this.battle.inspectUnitId);
     return (u && u.hp > 0) ? u : null;
   }
   isVisibleTile(r, c) { const k = `${r},${c}`; return this.battle.baseVisible.has(k) || this.battle.tempRevealed.has(k); }
@@ -923,12 +416,28 @@ class NavalApp {
     return (u.side === "A" || this.isVisibleTile(r, c)) ? u : null;
   }
 
+  toggleSquadronSelection(idx) {
+    const u = this.selectedUnit(); if (!u || !u.squadrons) return;
+    if (!this.battle.squadronSelection) this.battle.squadronSelection = new Set();
+    if (this.battle.squadronSelection.has(idx)) this.battle.squadronSelection.delete(idx);
+    else this.battle.squadronSelection.add(idx);
+    this.render();
+  }
+
   onCellClick(r, c) {
     const key = `${r},${c}`;
     if (!this.battle.selectedUnitId) {
       const u = this.visibleUnitAt(r, c);
-      if (u) this.toast(`${unitLabel(u, "pvai")}  HP:${u.hp}/${UNIT_TYPES[u.type].hp}`, "info");
       if (u && u.side === "A") this.selectUnit(u.id);
+      else if (u && u.side === "B") {
+        this.battle.inspectUnitId = u.id;
+        this.battle.uiMode = "idle";
+        this.battle.highlight = new Set();
+        this.render();
+      } else {
+        this.battle.inspectUnitId = null;
+        this.render();
+      }
       return;
     }
     const unit = this.selectedUnit();
@@ -937,7 +446,7 @@ class NavalApp {
     if (mode === "move") { if (this.battle.highlight.has(key)) this.moveUnit(unit, r, c); return; }
     if (mode === "gun") { if (this.battle.highlight.has(key)) { const t = unitAt(this.battle.units, r, c); if (t) this.executeAttack(unit, t, "gun"); } return; }
     if (mode === "torpedo") { if (this.battle.highlight.has(key)) { const t = unitAt(this.battle.units, r, c); if (t) this.executeAttack(unit, t, "torpedo"); } return; }
-    if (mode.startsWith("squadron-")) {
+    if (mode.startsWith("squadron-") && mode !== "squadron-multi") {
       if (this.battle.highlight.has(key)) {
         const idx = parseInt(mode.substring(9));
         const t = unitAt(this.battle.units, r, c);
@@ -945,9 +454,23 @@ class NavalApp {
       }
       return;
     }
+    if (mode === "squadron-multi") {
+      if (this.battle.highlight.has(key)) {
+        const t = unitAt(this.battle.units, r, c);
+        if (t) this.executeMultiSquadronAttack(unit, t);
+      }
+      return;
+    }
     if (mode === "ability") { if (this.battle.highlight.has(key)) this.executeAbility(unit, r, c); return; }
     const clicked = this.visibleUnitAt(r, c);
     if (clicked && clicked.side === "A") this.selectUnit(clicked.id);
+    else if (clicked && clicked.side === "B") {
+      this.battle.inspectUnitId = clicked.id;
+      this.battle.selectedUnitId = null;
+      this.battle.uiMode = "idle";
+      this.battle.highlight = new Set();
+      this.render();
+    }
   }
 
   enterMoveMode() {
@@ -987,16 +510,24 @@ class NavalApp {
     if (set.size === 0) this.toast("射程内に敵艦がいません", "danger");
     this.render();
   }
+  enterMultiSquadronMode() {
+    const u = this.selectedUnit(); if (!u || u.hasActed || !u.squadrons) return;
+    const sel = Array.from(this.battle.squadronSelection || []);
+    const active = sel.filter(i => u.squadrons[i] && u.squadrons[i].hp > 0);
+    if (active.length < 2) return;
+    const set = new Set();
+    this.battle.units.filter(e => e.side === "B" && e.hp > 0).forEach(e => {
+      if (chebyshev(u.r, u.c, e.r, e.c) <= AIR_RANGE && this.isVisibleTile(e.r, e.c)) set.add(`${e.r},${e.c}`);
+    });
+    this.battle.uiMode = "squadron-multi"; this.battle.highlight = set;
+    if (set.size === 0) this.toast("射程内に敵艦がいません", "danger");
+    this.render();
+  }
   enterAbilityMode() {
     const u = this.selectedUnit(); if (!u || u.hasActed) return;
     const def = UNIT_TYPES[u.type]; if (!def.ability || u.abilityUses <= 0) return;
     const ab = def.ability;
-
-    if (SELF_BUFF_TYPES.has(ab.type)) {
-      this.executeAbility(u, u.r, u.c);
-      return;
-    }
-
+    if (SELF_BUFF_TYPES.has(ab.type)) { this.executeAbility(u, u.r, u.c); return; }
     const set = new Set();
     if (ab.type === "salvo") {
       for (let r = 0; r < MAP.rows; r++) {
@@ -1008,18 +539,17 @@ class NavalApp {
       this.battle.units.filter(e => e.side === "B" && e.hp > 0 && e.type === "SS").forEach(e => {
         if (chebyshev(u.r, u.c, e.r, e.c) <= ab.range && this.isVisibleTile(e.r, e.c)) set.add(`${e.r},${e.c}`);
       });
-      if (set.size === 0) {
-        this.toast("射程内に敵潜水艦がいません", "danger");
-        return;
-      }
+      if (set.size === 0) { this.toast("射程内に敵潜水艦がいません", "danger"); return; }
     } else if (ab.type === "focusedFire") {
       this.battle.units.filter(e => e.side === "B" && e.hp > 0).forEach(e => {
         if (chebyshev(u.r, u.c, e.r, e.c) <= ab.range && this.isVisibleTile(e.r, e.c)) set.add(`${e.r},${e.c}`);
       });
-      if (set.size === 0) {
-        this.toast("射程内に敵艦がいません", "danger");
-        return;
-      }
+      if (set.size === 0) { this.toast("射程内に敵艦がいません", "danger"); return; }
+    } else if (ab.type === "resupply") {
+      this.battle.units.filter(e => e.side === "A" && e.hp > 0 && e.id !== u.id).forEach(e => {
+        if (chebyshev(u.r, u.c, e.r, e.c) <= ab.range) set.add(`${e.r},${e.c}`);
+      });
+      if (set.size === 0) { this.toast("射程内に味方がいません", "danger"); return; }
     }
     this.battle.uiMode = "ability"; this.battle.highlight = set;
     if (set.size === 0) this.toast("発動可能な対象がありません", "danger");
@@ -1030,6 +560,7 @@ class NavalApp {
     const u = this.selectedUnit(); if (!u) return;
     u.hasMoved = true; u.hasActed = true;
     this.battle.selectedUnitId = null; this.battle.uiMode = "idle"; this.battle.highlight = new Set();
+    this.battle.squadronSelection = new Set();
     this.render();
   }
   moveUnit(unit, r, c) {
@@ -1056,8 +587,28 @@ class NavalApp {
     const beforeHp = sq.hp;
     resolveAttack(cv, target, weapon, unitLabel(cv, "pvai"), targetLabel, (m) => this.pushLog(m), this.battle.units);
     if (target.hp <= 0) this.toast(`${targetLabel}撃沈！`, "success");
-    if (sq.hp <= 0 && beforeHp > 0) this.toast(`${sq.label}が撃墜された`, "danger");
+    if (sq.hp <= 0 && beforeHp > 0) this.toast(`${sq.label}が全滅`, "danger");
     cv.hasActed = true;
+    this.battle.squadronSelection = new Set();
+    this.battle.uiMode = "idle"; this.battle.highlight = new Set();
+    const oc = checkOutcome(this.battle);
+    if (oc) { this.finishBattle(oc); return; }
+    this.render();
+  }
+  executeMultiSquadronAttack(cv, target) {
+    const sel = Array.from(this.battle.squadronSelection || []);
+    const active = sel.filter(i => cv.squadrons[i] && cv.squadrons[i].hp > 0);
+    if (active.length < 2) return;
+    const beforeHps = active.map(i => cv.squadrons[i].hp);
+    resolveCombinedAirAttack(cv, active, target, (m) => this.pushLog(m), this.battle.units);
+    const targetLabel = unitLabel(target, "pvai");
+    if (target.hp <= 0) this.toast(`${targetLabel}撃沈！`, "success");
+    active.forEach((i, k) => {
+      const sq = cv.squadrons[i];
+      if (sq.hp <= 0 && beforeHps[k] > 0) this.toast(`${sq.label}が全滅`, "danger");
+    });
+    cv.hasActed = true;
+    this.battle.squadronSelection = new Set();
     this.battle.uiMode = "idle"; this.battle.highlight = new Set();
     const oc = checkOutcome(this.battle);
     if (oc) { this.finishBattle(oc); return; }
@@ -1090,6 +641,19 @@ class NavalApp {
       unit.hasActed = true;
       const oc = checkOutcome(this.battle);
       if (oc) { this.finishBattle(oc); return; }
+    } else if (ab.type === "resupply") {
+      const target = unitAt(this.battle.units, r, c);
+      if (!target || target.side !== "A" || target.hp <= 0 || target.id === unit.id) return;
+      const tdef = UNIT_TYPES[target.type];
+      const before = target.hp;
+      target.hp = Math.min(tdef.hp, target.hp + ab.heal);
+      const healAmount = target.hp - before;
+      const resupplied = [];
+      if (tdef.torpedo && target.torpedoUses < tdef.torpedo.uses) { target.torpedoUses++; resupplied.push("魚雷1"); }
+      if (tdef.ability && target.abilityUses < tdef.ability.uses) { target.abilityUses++; resupplied.push("能力1"); }
+      this.pushLog(`${unitLabel(unit, "pvai")}が${ab.label}を実行、${unitLabel(target, "pvai")}のHPを${healAmount}回復${resupplied.length ? "、" + resupplied.join("・") + "補充" : ""}。`);
+      this.toast(`${ab.label}発動！`, "event");
+      unit.abilityUses--; unit.hasActed = true;
     } else if (ab.type === "evade" || ab.type === "dive") {
       unit.evasionBuff = (unit.evasionBuff || 0) + ab.boost;
       this.pushLog(`${unitLabel(unit, "pvai")}が${ab.label}を展開、回避力が上昇した。`);
@@ -1142,7 +706,7 @@ class NavalApp {
     }
     if (s.phase === "A-start") {
       b.units.forEach(u => { if (u.side === "A") { u.hasMoved = false; u.hasActed = false; u.evasionBuff = 0; u.aaBuff = 0; } });
-      s.side = "A"; s.weights = this.champion.weights;
+      s.side = "A"; s.weights = this.getSpectateWeightsA();
       s.visible = computeVisibility(b.units, "A");
       s.unitQueue = b.units.filter(u => u.side === "A" && u.hp > 0);
       s.unitIndex = 0; s.phase = "act";
@@ -1151,7 +715,7 @@ class NavalApp {
     }
     if (s.phase === "B-start") {
       b.units.forEach(u => { if (u.side === "B") { u.hasMoved = false; u.hasActed = false; u.evasionBuff = 0; u.aaBuff = 0; } });
-      s.side = "B"; s.weights = this.baseline.weights;
+      s.side = "B"; s.weights = this.getSpectateWeightsB();
       s.visible = computeVisibility(b.units, "B");
       s.unitQueue = b.units.filter(u => u.side === "B" && u.hp > 0);
       s.unitIndex = 0; s.phase = "act";
@@ -1323,7 +887,7 @@ class NavalApp {
       <div class="stage-select">
         <div class="stage-card">
           <h2>⚔ AI観戦モード</h2>
-          <p class="stage-desc">学習済みAI（青軍）と敵艦隊（赤軍）を自動対戦させます。敵艦隊はJSONからインポート可能です。</p>
+          <p class="stage-desc">学習済みAI（青軍）と敵艦隊（赤軍）を自動対戦させます。敵艦隊はJSONからインポート、またはランダム生成できます。</p>
           <p class="stage-meta">${this.hasTrained ? `学習済み編成: ${fleetDisplayString(this.champion.fleet)}` : "まだ学習していません（初期AI同士の対戦になります）"}${this.spectateEnemyFleet ? `<br>敵艦隊: ${fleetDisplayString(this.spectateEnemyFleet)}` : ""}</p>
           <button onclick="game.startSpectate()">観戦を始める</button>
         </div>
@@ -1382,7 +946,8 @@ class NavalApp {
             ${UNIT_KEYS.map(t => {
               const def = UNIT_TYPES[t];
               const disabled = (usedShips + 1 > MAP.budget.maxShips) || (usedDisp + def.displacement > MAP.budget.maxDisplacement);
-              const extra = (t === "CV" || t === "CVL") ? `航空${makeSquadronsFor(t).length}隊` : `AA${def.aa}/ASW${def.asw}`;
+              const isCarrier = (t === "CV" || t === "CVL" || t === "AV");
+              const extra = isCarrier ? `航空${makeSquadronsFor(t).length}隊` : `AA${def.aa}/ASW${def.asw}`;
               return `
                 <button class="roster-btn ${this.pendingType === t ? "active" : ""}" ${disabled ? "disabled" : ""} onclick="game.selectPendingType('${t}')">
                   <span class="b-icon">${ICONS[t]}</span>
@@ -1397,13 +962,28 @@ class NavalApp {
               <button onclick="game.applyDeployPreset(['BB','CV','DD'])">戦艦・空母・駆逐</button>
               <button onclick="game.applyDeployPreset(['BB','CA','DD','FF'])">護衛付き戦艦</button>
               <button onclick="game.applyDeployPreset(['CA','CA','CL','DD'])">重巡戦隊</button>
-              <button onclick="game.applyDeployPreset(['CVL','CVL','DD','FF','FF'])">軽空母機動</button>
+              <button onclick="game.applyDeployPreset(['CVL','AV','DD','FF','FF'])">軽空母機動</button>
               <button onclick="game.applyDeployPreset(['CV','CVL','CA','DD','FF'])">空母機動艦隊</button>
+              <button onclick="game.applyDeployPreset(['BB','CV','AO','DD','FF'])">補給支援艦隊</button>
               <button onclick="game.applyDeployPreset(['SS','SS','DD','CL','FF'])">潜水艦隊</button>
+              <button onclick="game.randomizePlayerFleet()">🎲 ランダム</button>
               <button onclick="game.clearDeploy()">クリア</button>
             </div>
           </div>
-          <p class="hint">艦種を選んで左のマップの自軍海域（青枠）をクリックして配備。相手は学習済みAIの編成（現在: ${fleetDisplayString(this.champion.fleet)}）です。</p>
+          <div class="unit-panel" style="padding:10px;">
+            ${this.aiSettingsPanelHTML("enemy", "敵AIの行動パラメータ")}
+          </div>
+          <div class="unit-panel">
+            <h3>敵編成の設定</h3>
+            <p class="hint">現在: <strong style="color:var(--gold)">${this.pvaiEnemyFleet ? fleetDisplayString(this.pvaiEnemyFleet) : `学習済みAI（${fleetDisplayString(this.champion.fleet)}）`}</strong></p>
+            <div class="spectate-controls" style="margin-top:8px; flex-wrap:wrap;">
+              <button onclick="document.getElementById('pvaiEnemyFile').click()">JSONからインポート</button>
+              <button onclick="game.randomizePvAIEnemy()">🎲 ランダム編成</button>
+              ${this.pvaiEnemyFleet ? `<button onclick="game.clearPvAIEnemy()">学習済みAIに戻す</button>` : ""}
+            </div>
+            <input id="pvaiEnemyFile" type="file" accept=".json,application/json" style="display:none" onchange="game.importPvAIEnemy(this)">
+          </div>
+          <p class="hint">艦種を選んで左のマップの自軍海域（青枠）をクリックして配備。相手編成は「敵編成の設定」から変更できます。</p>
           <button class="end-turn" onclick="game.startPvAIBattle()">戦闘開始</button>
           <button class="back" onclick="game.goModeSelect()">モード選択に戻る</button>
         </section>
@@ -1462,6 +1042,35 @@ class NavalApp {
     `;
   }
 
+  inspectPanelHTML(unit) {
+    const def = UNIT_TYPES[unit.type];
+    return `
+      <div class="unit-panel" style="border-color: var(--enemy-red);">
+        <h3 style="color: var(--enemy-red);">🔍 ${unitLabel(unit, "pvai")} の情報</h3>
+        <div class="stat-grid">
+          <div class="stat"><span class="stat-label">HP</span><span class="stat-value">${unit.hp}/${def.hp}</span></div>
+          <div class="stat"><span class="stat-label">移動</span><span class="stat-value">${def.move}</span></div>
+          <div class="stat"><span class="stat-label">砲撃力</span><span class="stat-value">${def.gunPower}</span></div>
+          <div class="stat"><span class="stat-label">射程</span><span class="stat-value">${def.gunRange}</span></div>
+          <div class="stat"><span class="stat-label">回避</span><span class="stat-value">${def.evasion}%${unit.evasionBuff ? ` (+${unit.evasionBuff})` : ""}</span></div>
+          <div class="stat"><span class="stat-label">防御</span><span class="stat-value">${def.defense}</span></div>
+          <div class="stat"><span class="stat-label">対空</span><span class="stat-value">${def.aa}${unit.aaBuff ? ` (+${unit.aaBuff})` : ""}</span></div>
+          <div class="stat"><span class="stat-label">対潜</span><span class="stat-value">${def.asw}</span></div>
+          <div class="stat"><span class="stat-label">視界</span><span class="stat-value">${def.vision}</span></div>
+          ${def.torpedo ? `<div class="stat"><span class="stat-label">魚雷威力</span><span class="stat-value">${def.torpedo.power}</span></div>` : ""}
+          ${def.torpedo ? `<div class="stat"><span class="stat-label">魚雷残</span><span class="stat-value">${unit.torpedoUses}</span></div>` : ""}
+          ${def.ability ? `<div class="stat"><span class="stat-label">能力</span><span class="stat-value">${def.ability.label} 残${unit.abilityUses}</span></div>` : ""}
+        </div>
+        ${unit.squadrons ? `
+          <div class="hint" style="margin-top:6px;">搭載航空隊:</div>
+          <div class="stat-grid" style="grid-template-columns:1fr;">
+            ${unit.squadrons.map(sq => `<div class="stat"><span class="stat-label">${sq.label}</span><span class="stat-value">${sq.hp}/${sq.maxHp}（対艦${sq.attackPower}/対空${sq.airAttack}）</span></div>`).join("")}
+          </div>` : ""}
+        <p class="hint" style="margin-top:8px;">クリックで選択解除。自軍艦をクリックすると操作できます。</p>
+      </div>
+    `;
+  }
+
   unitPanelHTML(unit) {
     const def = UNIT_TYPES[unit.type];
     const ab = def.ability;
@@ -1473,14 +1082,26 @@ class NavalApp {
       unit.squadrons.forEach((sq, i) => {
         const disabled = unit.hasActed || sq.hp <= 0;
         const hpPct = Math.round(sq.hp / sq.maxHp * 100);
-        buttons += `<button ${disabled ? "disabled" : ""} onclick="game.enterSquadronMode(${i})">${sq.label} (HP${sq.hp}/${sq.maxHp} ${hpPct}%・威力${sq.attackPower})</button>`;
+        const checked = this.battle.squadronSelection && this.battle.squadronSelection.has(i);
+        buttons += `
+          <div style="display:flex; gap:6px; align-items:stretch;">
+            <label title="同時出撃に追加" style="display:flex; align-items:center; padding:0 6px; background:rgba(0,0,0,0.22); border:1px solid var(--border); border-radius:6px; cursor:${disabled ? "not-allowed" : "pointer"};">
+              <input type="checkbox" ${checked ? "checked" : ""} ${disabled ? "disabled" : ""} onclick="event.stopPropagation(); game.toggleSquadronSelection(${i});">
+            </label>
+            <button style="flex:1;" ${disabled ? "disabled" : ""} onclick="game.enterSquadronMode(${i})">${sq.label} (HP${sq.hp}/${sq.maxHp} ${hpPct}%・対艦${sq.attackPower}・対空${sq.airAttack})</button>
+          </div>`;
       });
+      const activeCount = Array.from(this.battle.squadronSelection || []).filter(i => unit.squadrons[i] && unit.squadrons[i].hp > 0).length;
+      if (activeCount >= 2) {
+        buttons += `<button class="end-turn" ${unit.hasActed ? "disabled" : ""} onclick="game.enterMultiSquadronMode()">選択した${activeCount}隊で同時攻撃</button>`;
+      }
     }
     if (ab) {
       let label;
       if (ab.type === "salvo") label = `${ab.label} (中心${ab.centerPower}/範囲${ab.splashPower})`;
       else if (ab.type === "aswStrike") label = `${ab.label} (対潜特効・射程${ab.range}・威力${ab.power})`;
       else if (ab.type === "focusedFire") label = `${ab.label} (射程${ab.range}・威力${ab.power})`;
+      else if (ab.type === "resupply") label = `${ab.label} (射程${ab.range}・回復${ab.heal})`;
       else label = ab.label;
       buttons += `<button ${unit.hasActed || unit.abilityUses <= 0 ? "disabled" : ""} onclick="game.enterAbilityMode()">${label} (残${unit.abilityUses})</button>`;
     }
@@ -1514,6 +1135,11 @@ class NavalApp {
 
   pvaiBattleHTML() {
     const unit = this.selectedUnit();
+    const inspected = this.inspectedUnit();
+    let panelHTML;
+    if (unit) panelHTML = this.unitPanelHTML(unit);
+    else if (inspected && inspected.side === "B") panelHTML = this.inspectPanelHTML(inspected);
+    else panelHTML = `<p class="hint">自軍艦をクリックして選択してください。敵艦をクリックすると情報を表示します。移動・砲撃・魚雷・特殊能力・航空攻撃を組み合わせて敵AI艦隊を撃破しましょう。</p>`;
     return `
       <header id="topbar">
         <h1>プレイヤー対AI</h1>
@@ -1522,9 +1148,7 @@ class NavalApp {
       <main class="battle-main">
         <section class="map-panel">${this.mapTableHTML()}</section>
         <section class="side-panel">
-          <div class="unit-panel">
-            ${unit ? this.unitPanelHTML(unit) : `<p class="hint">自軍艦をクリックして選択してください。移動・砲撃・魚雷・特殊能力・航空攻撃を組み合わせて敵AI艦隊を撃破しましょう。</p>`}
-          </div>
+          <div class="unit-panel">${panelHTML}</div>
           <button class="end-turn" onclick="game.endSideATurn()">ターン終了</button>
           <div class="fleet-list">
             <h3>自軍艦隊</h3>
@@ -1573,12 +1197,19 @@ class NavalApp {
           </div>
           <div class="unit-panel">
             <h3>敵艦隊の設定</h3>
-            <p class="hint">セーブデータ（JSON）をインポートすると、赤軍として使用します。<br>現在: <strong style="color:var(--gold)">${this.spectateEnemyFleet ? fleetDisplayString(this.spectateEnemyFleet) : "初期AI（BB・CV・DD）"}</strong></p>
-            <div class="spectate-controls" style="margin-top:8px;">
-              <button onclick="document.getElementById('spectateEnemyFile').click()">敵艦隊をインポート</button>
+            <p class="hint">現在: <strong style="color:var(--gold)">${this.spectateEnemyFleet ? fleetDisplayString(this.spectateEnemyFleet) : "初期AI（BB・CV・DD）"}</strong></p>
+            <div class="spectate-controls" style="margin-top:8px; flex-wrap:wrap;">
+              <button onclick="document.getElementById('spectateEnemyFile').click()">JSONからインポート</button>
+              <button onclick="game.randomizeSpectateEnemy()">🎲 ランダム編成</button>
               ${this.spectateEnemyFleet ? `<button onclick="game.clearSpectateEnemy()">初期AIに戻す</button>` : ""}
             </div>
             <input id="spectateEnemyFile" type="file" accept=".json,application/json" style="display:none" onchange="game.importSpectateEnemy(this)">
+          </div>
+          <div class="unit-panel" style="padding:10px;">
+            ${this.aiSettingsPanelHTML("A", "青軍AIの行動パラメータ")}
+          </div>
+          <div class="unit-panel" style="padding:10px;">
+            ${this.aiSettingsPanelHTML("B", "赤軍AIの行動パラメータ")}
           </div>
           <div class="fleet-list">
             <h3>青軍（${fleetDisplayString(this.champion.fleet)}）</h3>
@@ -1680,7 +1311,7 @@ class NavalApp {
           <button class="ghost" onclick="document.getElementById('importFile').click()" ${this.isTraining ? "disabled" : ""}>セーブをインポート</button>
           <input id="importFile" type="file" accept=".json,application/json" style="display:none" onchange="game.handleImportFile(this)">
         </div>
-        <p class="hint" style="margin-top:-6px;">エクスポートしたJSONには、現在のチャンピオン（行動＋編成）、初期AI、学習履歴、学習ログが含まれます。</p>
+        <p class="hint" style="margin-top:-6px;">エクスポートボタンで保存先ダイアログが開きます（対応ブラウザ）。非対応の場合はダウンロードフォルダに保存されます。</p>
       </div>
       <section class="log-panel">
         <h3>学習ログ（[行動] / [編成] / [行動+編成] で変異タイプを表示）</h3>
@@ -1729,5 +1360,3 @@ class NavalApp {
     setTimeout(() => { t.classList.remove("show"); setTimeout(() => t.remove(), 300); }, 2600);
   }
 }
-
-const game = new NavalApp();
